@@ -26,6 +26,7 @@ const [identityKey] = defineField('identityKey');
 const [site] = defineField('site');
 const [ageBand] = defineField('ageBand');
 const [actor] = defineField('actor');
+const actorName = computed(() => actor.value ?? '研究者张宁');
 
 const visibleArm = (arm?: 'A' | 'B', status?: string) => {
   if (role.value === 'pharmacist') return arm ?? '待分配';
@@ -46,9 +47,43 @@ const submit = handleSubmit((values) => {
 const unblind = async (id: string, participantNumber: string) => {
   try {
     const { value } = await ElMessageBox.prompt(`为 ${participantNumber} 填写紧急揭盲原因`, '紧急揭盲', { inputType: 'textarea', inputValidator: (value) => Boolean(value?.trim()) || '揭盲原因不能为空', confirmButtonText: '确认并审计' });
-    trial.emergencyUnblind(id, value, actor.value);
+    trial.emergencyUnblind(id, value, actorName.value);
     ElMessage.warning('已揭盲，审计记录已追加');
   } catch {}
+};
+
+const commitOne = (id: string) => {
+  const result = trial.commitPending(id, actorName.value);
+  if (result.ok) ElMessage.success(result.message);
+  else ElMessage.error(result.message);
+};
+
+const mergeAll = () => {
+  const result = trial.commitAllPending(actorName.value);
+  if (result.total === 0) {
+    ElMessage.info('没有待提交记录');
+    return;
+  }
+  ElMessage.success(`联网合并完成：${result.committed} 条入库，${result.conflicts} 条冲突已留存`);
+};
+
+const reissue = async (id: string, participantNumber: string) => {
+  try {
+    await ElMessageBox.confirm(
+      `重新发号将作废 ${participantNumber} 的原随机号与治疗组，并按“中心+年龄层”区组平衡重新发号；若已揭盲，原揭盲结论立即失效并需重新确认。是否继续？`,
+      '重新发号',
+      { type: 'warning', confirmButtonText: '确认重新发号', cancelButtonText: '取消' }
+    );
+    const result = trial.reissueParticipant(id, actorName.value);
+    if (result.ok) ElMessage.success(result.message);
+    else ElMessage.error(result.message);
+  } catch {}
+};
+
+const auditType = (action: string) => {
+  if (action === 'unblinded' || action === 'unblinding-invalidated') return 'danger';
+  if (action === 'duplicate-blocked' || action === 'pending-conflict') return 'warning';
+  return 'primary';
 };
 
 const counts = computed(() => ({
@@ -93,25 +128,44 @@ const counts = computed(() => ({
           <el-table-column prop="site" label="中心" min-width="110" />
           <el-table-column prop="sequence" label="随机号" width="90" />
           <el-table-column label="治疗组" width="100"><template #default="{ row }"><el-tag :type="row.status === 'unblinded' ? 'danger' : 'info'">{{ visibleArm(row.arm, row.status) }}</el-tag></template></el-table-column>
-          <el-table-column label="操作" width="100"><template #default="{ row }"><el-button v-if="role === 'investigator'" size="small" type="danger" plain @click="unblind(row.id, row.participantNo)">揭盲</el-button></template></el-table-column>
+          <el-table-column label="状态" width="90"><template #default="{ row }"><el-tag :type="row.status === 'unblinded' ? 'danger' : 'success'">{{ row.status === 'unblinded' ? '已揭盲' : '随机中' }}</el-tag></template></el-table-column>
+          <el-table-column label="操作" width="170"><template #default="{ row }">
+            <el-button v-if="role === 'investigator'" size="small" type="danger" plain @click="unblind(row.id, row.participantNo)">揭盲</el-button>
+            <el-button v-if="role === 'investigator'" size="small" type="warning" plain @click="reissue(row.id, row.participantNo)">重新发号</el-button>
+          </template></el-table-column>
         </el-table>
       </el-card>
     </div>
 
     <div class="grid" style="margin-top:20px">
       <el-card shadow="never">
-        <template #header><b>{{ t('pending') }}</b></template>
+        <template #header><div style="display:flex;justify-content:space-between;align-items:center"><b>{{ t('pending') }}</b><el-button size="small" type="success" plain :disabled="trial.pendingCount === 0" @click="mergeAll">全部联网合并</el-button></div></template>
         <el-empty v-if="pending.length === 0" description="暂无待提交记录" />
-        <el-table v-else :data="pending">
-          <el-table-column prop="payload.participantNo" label="受试者" />
-          <el-table-column prop="status" label="状态" />
-          <el-table-column label="操作"><template #default="{ row }"><el-button :disabled="row.status !== 'pending'" size="small" type="primary" @click="trial.commitPending(row.id, actor)">确认入库</el-button></template></el-table-column>
+        <el-table v-else :data="pending" max-height="320">
+          <el-table-column prop="payload.participantNo" label="受试者" min-width="110" />
+          <el-table-column prop="payload.identityKey" label="身份标识" min-width="110" />
+          <el-table-column prop="payload.site" label="中心" min-width="100" />
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag :type="row.status === 'committed' ? 'success' : row.status === 'conflict' ? 'danger' : 'info'">
+                {{ row.status === 'committed' ? '已入库' : row.status === 'conflict' ? '冲突' : '待提交' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="conflictReason" label="冲突原因" min-width="220" show-overflow-tooltip />
+          <el-table-column label="操作" width="110">
+            <template #default="{ row }">
+              <el-button v-if="row.status === 'pending'" size="small" type="primary" @click="commitOne(row.id)">确认入库</el-button>
+              <el-tag v-else-if="row.status === 'conflict'" type="danger" effect="plain">已留存</el-tag>
+              <span v-else>—</span>
+            </template>
+          </el-table-column>
         </el-table>
       </el-card>
       <el-card shadow="never">
         <template #header><b>{{ t('audit') }}</b><el-tag type="warning" style="float:right">仅追加</el-tag></template>
         <el-timeline>
-          <el-timeline-item v-for="entry in audits" :key="entry.id" :timestamp="new Date(entry.at).toLocaleString()" :type="entry.action === 'unblinded' ? 'danger' : entry.action === 'duplicate-blocked' ? 'warning' : 'primary'">
+          <el-timeline-item v-for="entry in audits" :key="entry.id" :timestamp="new Date(entry.at).toLocaleString()" :type="auditType(entry.action)">
             <b>{{ entry.actor }} · {{ entry.action }}</b><div>{{ entry.detail }}</div>
           </el-timeline-item>
         </el-timeline>
